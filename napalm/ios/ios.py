@@ -12,10 +12,6 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
 # the License.
-
-from __future__ import print_function
-from __future__ import unicode_literals
-
 import copy
 import functools
 import os
@@ -43,9 +39,12 @@ from napalm.base.helpers import (
     canonical_interface_name,
     transform_lldp_capab,
     textfsm_extractor,
+    split_interface,
+    abbreviated_interface_name,
+    generate_regex_or,
+    sanitize_configs,
 )
 from napalm.base.netmiko_helpers import netmiko_args
-from napalm.base.utils import py23_compat
 
 # Easier to store these as constants
 HOUR_SECONDS = 3600
@@ -159,6 +158,7 @@ class IOSDriver(NetworkDriver):
         self.platform = "ios"
         self.profile = [self.platform]
         self.use_canonical_interface = optional_args.get("canonical_int", False)
+        self.force_no_enable = optional_args.get("force_no_enable", False)
 
     def open(self):
         """Open a connection to the device."""
@@ -237,7 +237,7 @@ class IOSDriver(NetworkDriver):
     def _create_tmp_file(config):
         """Write temp file and for use with inline config and SCP."""
         tmp_dir = tempfile.gettempdir()
-        rand_fname = py23_compat.text_type(uuid.uuid4())
+        rand_fname = str(uuid.uuid4())
         filename = os.path.join(tmp_dir, rand_fname)
         with open(filename, "wt") as fobj:
             fobj.write(config)
@@ -753,21 +753,46 @@ class IOSDriver(NetworkDriver):
         output = re.sub(r"^Time source is .*$", "", output, flags=re.M)
         return output.strip()
 
+    def _is_vss(self):
+        """
+        Returns True if a Virtual Switching System (VSS) is setup
+        """
+        vss_re = re.compile("Switch mode[ ]+: Virtual Switch", re.M)
+        command = "show switch virtual"
+        output = self._send_command(command)
+
+        return bool(vss_re.search(output))
+
     def get_optics(self):
         command = "show interfaces transceiver"
         output = self._send_command(command)
+        is_vss = False
 
         # Check if router supports the command
         if "% Invalid input" in output:
             return {}
+        elif "% Incomplete command" in output:
+            if self._is_vss():
+                is_vss = True
+                command1 = "show interfaces transceiver switch 1"
+                command2 = "show interfaces transceiver switch 2"
+                output1 = self._send_command(command1)
+                output2 = self._send_command(command2)
 
         # Formatting data into return data structure
         optics_detail = {}
 
-        try:
-            split_output = re.split(r"^---------.*$", output, flags=re.M)[1]
-        except IndexError:
-            return {}
+        if is_vss:
+            try:
+                split_output = re.split(r"^---------.*$", output1, flags=re.M)[1]
+                split_output += re.split(r"^---------.*$", output2, flags=re.M)[1]
+            except IndexError:
+                return {}
+        else:
+            try:
+                split_output = re.split(r"^---------.*$", output, flags=re.M)[1]
+            except IndexError:
+                return {}
 
         split_output = split_output.strip()
 
@@ -786,12 +811,17 @@ class IOSDriver(NetworkDriver):
 
             port_detail = {"physical_channels": {"channel": []}}
 
-            # If interface is shutdown it returns "N/A" as output power.
+            # If interface is shutdown it returns "N/A" as output power
+            # or "N/A" as input power
             # Converting that to -100.0 float
             try:
                 float(output_power)
             except ValueError:
                 output_power = -100.0
+            try:
+                float(input_power)
+            except ValueError:
+                input_power = -100.0
 
             # Defaulting avg, min, max values to -100.0 since device does not
             # return these values
@@ -826,18 +856,6 @@ class IOSDriver(NetworkDriver):
 
     def get_lldp_neighbors(self):
         """IOS implementation of get_lldp_neighbors."""
-
-        def _device_id_expand(device_id, local_int_brief):
-            """Device id might be abbreviated: try to obtain the full device id."""
-            lldp_tmp = self._lldp_detail_parser(local_int_brief)
-            device_id_new = lldp_tmp[3][0]
-            # Verify abbreviated and full name are consistent
-            if device_id_new[:20] == device_id:
-                return device_id_new
-            else:
-                # Else return the original device_id
-                return device_id
-
         lldp = {}
         neighbors_detail = self.get_lldp_neighbors_detail()
         for intf_name, entries in neighbors_detail.items():
@@ -1007,10 +1025,10 @@ class IOSDriver(NetworkDriver):
         return {
             "uptime": uptime,
             "vendor": vendor,
-            "os_version": py23_compat.text_type(os_version),
-            "serial_number": py23_compat.text_type(serial_number),
-            "model": py23_compat.text_type(model),
-            "hostname": py23_compat.text_type(hostname),
+            "os_version": str(os_version),
+            "serial_number": str(serial_number),
+            "model": str(model),
+            "hostname": str(hostname),
             "fqdn": fqdn,
             "interface_list": interface_list,
         }
@@ -1513,9 +1531,9 @@ class IOSDriver(NetworkDriver):
         # get summary output from device
         cmd_bgp_all_sum = "show bgp all summary"
         summary_output = self._send_command(cmd_bgp_all_sum).strip()
-
-        if "Invalid input detected" in summary_output:
-            raise CommandErrorException("BGP is not running on this device")
+        bgp_not_running = ["Invalid input", "BGP not active"]
+        if any((s in summary_output for s in bgp_not_running)):
+            return {}
 
         # get neighbor output from device
         neighbor_output = ""
@@ -1831,7 +1849,7 @@ class IOSDriver(NetworkDriver):
 
             # get description
             try:
-                description = py23_compat.text_type(neighbor_entry["description"])
+                description = str(neighbor_entry["description"])
             except KeyError:
                 description = ""
 
@@ -2119,6 +2137,14 @@ class IOSDriver(NetworkDriver):
                     match = re.search(r"(\d+) output errors", line)
                     counters[interface]["tx_errors"] = int(match.group(1))
                     counters[interface]["tx_discards"] = -1
+
+            interface_type, interface_number = split_interface(interface)
+            if interface_type in [
+                "HundredGigabitEthernet",
+                "FortyGigabitEthernet",
+                "TenGigabitEthernet",
+            ]:
+                interface = abbreviated_interface_name(interface)
             for line in sh_int_sum_cmd_out.splitlines():
                 if interface in line:
                     # Line is tabular output with columns
@@ -2133,8 +2159,17 @@ class IOSDriver(NetworkDriver):
                     )
                     match = re.search(regex, line)
                     if match:
-                        counters[interface]["rx_discards"] = int(match.group("IQD"))
-                        counters[interface]["tx_discards"] = int(match.group("OQD"))
+                        can_interface = canonical_interface_name(interface)
+                        try:
+                            counters[can_interface]["rx_discards"] = int(
+                                match.group("IQD")
+                            )
+                            counters[can_interface]["tx_discards"] = int(
+                                match.group("OQD")
+                            )
+                        except KeyError:
+                            counters[interface]["rx_discards"] = int(match.group("IQD"))
+                            counters[interface]["tx_discards"] = int(match.group("OQD"))
 
         return counters
 
@@ -2375,19 +2410,27 @@ class IOSDriver(NetworkDriver):
                 return []
 
             elif len(line.split()) == 9:
-                address, ref_clock, st, when, poll, reach, delay, offset, disp = (
-                    line.split()
-                )
+                (
+                    address,
+                    ref_clock,
+                    st,
+                    when,
+                    poll,
+                    reach,
+                    delay,
+                    offset,
+                    disp,
+                ) = line.split()
                 address_regex = re.match(r"(\W*)([0-9.*]*)", address)
             try:
                 ntp_stats.append(
                     {
-                        "remote": py23_compat.text_type(address_regex.group(2)),
+                        "remote": str(address_regex.group(2)),
                         "synchronized": ("*" in address_regex.group(1)),
-                        "referenceid": py23_compat.text_type(ref_clock),
+                        "referenceid": str(ref_clock),
                         "stratum": int(st),
                         "type": "-",
-                        "when": py23_compat.text_type(when),
+                        "when": str(when),
                         "hostpoll": int(poll),
                         "reachability": int(reach),
                         "delay": float(delay),
@@ -2448,9 +2491,7 @@ class IOSDriver(NetworkDriver):
         )  # 7 fields
         RE_MACTABLE_6500_2 = r"^{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)  # 6 fields
         RE_MACTABLE_6500_3 = r"^\s{51}\S+"  # Fill down prior
-        RE_MACTABLE_6500_4 = r"^R\s+{}\s+.*Router".format(
-            VLAN_REGEX, MAC_REGEX
-        )  # Router field
+        RE_MACTABLE_6500_4 = r"^R\s+{}\s+.*Router".format(VLAN_REGEX)  # Router field
         RE_MACTABLE_6500_5 = r"^R\s+N/A\s+{}.*Router".format(
             MAC_REGEX
         )  # Router skipped
@@ -2631,6 +2672,14 @@ class IOSDriver(NetworkDriver):
             elif re.search(
                 r"Displaying entries from active supervisor:\s+\w+\s+\[\d\]:", line
             ):
+                continue
+            elif re.search(r"EHWIC:.*", line):
+                # Skip module - process_mac_fields doesn't care.
+                continue
+            elif re.search(
+                r"Destination Address.*Address.*Type.*VLAN.*Destination.*Port", line
+            ):
+                # If there are multiple modules, this line gets repeated for each module.
                 continue
             else:
                 raise ValueError("Unexpected output from: {}".format(repr(line)))
@@ -2836,7 +2885,7 @@ class IOSDriver(NetworkDriver):
                     bgp_attr["remote_as"] = napalm.base.helpers.as_number(bgpras)
         return bgp_attr
 
-    def get_route_to(self, destination="", protocol=""):
+    def get_route_to(self, destination="", protocol="", longer=False):
         """
         Only IPv4 is supported
         VRFs are supported
@@ -2870,6 +2919,9 @@ class IOSDriver(NetworkDriver):
             ]
         }
         """
+
+        if longer:
+            raise NotImplementedError("Longer prefixes not yet supported for IOS")
 
         output = []
         # Placeholder for vrf arg
@@ -2975,8 +3027,8 @@ class IOSDriver(NetworkDriver):
                                         destination, _vrf, nh, ip_version
                                     )
                                 nh_line_found = (
-                                    False
-                                )  # for next RT entry processing ...
+                                    False  # for next RT entry processing ...
+                                )
                                 routes[destination].append(route_entry)
         return routes
 
@@ -3157,10 +3209,7 @@ class IOSDriver(NetworkDriver):
                     results_array = []
                     for i in range(probes_received):
                         results_array.append(
-                            {
-                                "ip_address": py23_compat.text_type(destination),
-                                "rtt": 0.0,
-                            }
+                            {"ip_address": str(destination), "rtt": 0.0}
                         )
                     ping_dict["success"].update({"results": results_array})
 
@@ -3202,8 +3251,8 @@ class IOSDriver(NetworkDriver):
         if source:
             command += " source {}".format(source)
         if ttl:
-            if isinstance(ttl, int) and 0 <= timeout <= 255:
-                command += " ttl 0 {}".format(str(ttl))
+            if isinstance(ttl, int) and 0 <= ttl <= 255:
+                command += " ttl {}".format(str(ttl))
         if timeout:
             # Timeout should be an integer between 1 and 3600
             if isinstance(timeout, int) and 1 <= timeout <= 3600:
@@ -3242,8 +3291,12 @@ class IOSDriver(NetworkDriver):
                 stop_index = next_hop_match.start()
                 # Now you have the start and stop index for each hop
                 # and you can parse the probes
-            # Set the hop_variable, and remove spaces between msec for easier matching
-            hop_string = output[start_index:stop_index].replace(" msec", "msec")
+            # Set the hop_variable, and remove spaces between msec and [AS 1234] for easier matching
+            hop_string = re.sub(
+                r" \[AS [0-9.]+\]",
+                "",
+                output[start_index:stop_index].replace(" msec", "msec"),
+            )
             hop_list = hop_string.split()
             current_hop = int(hop_list.pop(0))
             # Prepare dictionary for each hop (assuming there are 3 probes in each hop)
@@ -3274,8 +3327,8 @@ class IOSDriver(NetworkDriver):
                     current_probe += 1
                 # If current_element contains msec record the entry for probe
                 elif "msec" in current_element:
-                    ip_address = py23_compat.text_type(ip_address)
-                    host_name = py23_compat.text_type(host_name)
+                    ip_address = str(ip_address)
+                    host_name = str(host_name)
                     rtt = float(current_element.replace("msec", ""))
                     results[current_hop]["probes"][current_probe][
                         "ip_address"
@@ -3320,6 +3373,13 @@ class IOSDriver(NetworkDriver):
             "interfaces": {"interface": interface_dict},
         }
 
+        # No vrf is defined return default one
+        if len(sh_vrf_detail) == 0:
+            if name:
+                raise ValueError("No vrf is setup on router")
+            else:
+                return instances
+
         for vrf in sh_vrf_detail.split("\n\n"):
 
             first_part = vrf.split("Address family")[0]
@@ -3342,9 +3402,12 @@ class IOSDriver(NetworkDriver):
                 "state": {"route_distinguisher": RD},
                 "interfaces": {"interface": interfaces},
             }
-        return instances if not name else instances[name]
+        try:
+            return instances if not name else instances[name]
+        except AttributeError:
+            raise ValueError("The vrf %s does not exist" % name)
 
-    def get_config(self, retrieve="all", full=False):
+    def get_config(self, retrieve="all", full=False, sanitized=False):
         """Implementation of get_config for IOS.
 
         Returns the startup or/and running configuration as dictionary.
@@ -3353,6 +3416,16 @@ class IOSDriver(NetworkDriver):
         since IOS does not support candidate configuration.
         """
 
+        # The output of get_config should be directly usable by load_replace_candidate()
+        # IOS adds some extra, unneeded lines that should be filtered.
+        filter_strings = [
+            r"^Building configuration.*$",
+            r"^Current configuration :.*$",
+            r"^! Last configuration change at.*$",
+            r"^! NVRAM config last updated at.*$",
+        ]
+        filter_pattern = generate_regex_or(filter_strings)
+
         configs = {"startup": "", "running": "", "candidate": ""}
         # IOS only supports "all" on "show run"
         run_full = " all" if full else ""
@@ -3360,12 +3433,17 @@ class IOSDriver(NetworkDriver):
         if retrieve in ("startup", "all"):
             command = "show startup-config"
             output = self._send_command(command)
-            configs["startup"] = output
+            output = re.sub(filter_pattern, "", output, flags=re.M)
+            configs["startup"] = output.strip()
 
         if retrieve in ("running", "all"):
             command = "show running-config{}".format(run_full)
             output = self._send_command(command)
-            configs["running"] = output
+            output = re.sub(filter_pattern, "", output, flags=re.M)
+            configs["running"] = output.strip()
+
+        if sanitized:
+            return sanitize_configs(configs, C.CISCO_SANITIZE_FILTERS)
 
         return configs
 
@@ -3428,3 +3506,61 @@ class IOSDriver(NetworkDriver):
         if self.device and self._dest_file_system is None:
             self._dest_file_system = self._discover_file_system()
         return self._dest_file_system
+
+    def get_vlans(self):
+        command = "show vlan all-ports"
+        output = self._send_command(command)
+        if output.find("Invalid input detected") >= 0:
+            return self._get_vlan_from_id()
+        else:
+            return self._get_vlan_all_ports(output)
+
+    def _get_vlan_all_ports(self, output):
+        find_regexp = r"^(\d+)\s+(\S+)\s+\S+\s+([A-Z][a-z].*)$"
+        find = re.findall(find_regexp, output, re.MULTILINE)
+        vlans = {}
+        for vlan_id, vlan_name, interfaces in find:
+            vlans[vlan_id] = {
+                "name": vlan_name,
+                "interfaces": [
+                    canonical_interface_name(intf.strip())
+                    for intf in interfaces.split(",")
+                ],
+            }
+
+        find_regexp = r"^(\d+)\s+(\S+)\s+\S+$"
+        find = re.findall(find_regexp, output, re.MULTILINE)
+        for vlan_id, vlan_name in find:
+            vlans[vlan_id] = {"name": vlan_name, "interfaces": []}
+        return vlans
+
+    def _get_vlan_from_id(self):
+        command = "show vlan brief"
+        output = self._send_command(command)
+        vlan_regexp = r"^(\d+)\s+(\S+)\s+\S+.*$"
+        find_vlan = re.findall(vlan_regexp, output, re.MULTILINE)
+        vlans = {}
+        for vlan_id, vlan_name in find_vlan:
+            output = self._send_command("show vlan id {}".format(vlan_id))
+            interface_regex = r"{}\s+{}\s+\S+\s+([A-Z][a-z].*)$".format(
+                vlan_id, vlan_name
+            )
+            interfaces = re.findall(interface_regex, output, re.MULTILINE)
+            if len(interfaces) == 1:
+                interfaces = interfaces[0]
+                vlans[vlan_id] = {
+                    "name": vlan_name,
+                    "interfaces": [
+                        canonical_interface_name(intf.strip())
+                        for intf in interfaces.split(",")
+                    ],
+                }
+            elif len(interfaces) == 0:
+                vlans[vlan_id] = {"name": vlan_name, "interfaces": []}
+            else:
+                raise ValueError(
+                    "Error parsing vlan_id {}, "
+                    "found more values than can be present.".format(vlan_id)
+                )
+
+        return vlans

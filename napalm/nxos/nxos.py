@@ -13,8 +13,6 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-from __future__ import unicode_literals
-
 # import stdlib
 from builtins import super
 import os
@@ -29,18 +27,22 @@ from requests.exceptions import ConnectionError
 from netaddr import IPAddress
 from netaddr.core import AddrFormatError
 from netmiko import file_transfer
-from nxapi_plumbing import Device as NXOSDevice
-from nxapi_plumbing import NXAPIAuthError, NXAPIConnectionError, NXAPICommandError
+from napalm.nxapi_plumbing import Device as NXOSDevice
+from napalm.nxapi_plumbing import (
+    NXAPIAuthError,
+    NXAPIConnectionError,
+    NXAPICommandError,
+)
 import json
 
 # import NAPALM Base
 import napalm.base.helpers
 from napalm.base import NetworkDriver
-from napalm.base.utils import py23_compat
 from napalm.base.exceptions import ConnectionException
 from napalm.base.exceptions import MergeConfigException
 from napalm.base.exceptions import CommandErrorException
 from napalm.base.exceptions import ReplaceConfigException
+from napalm.base.helpers import generate_regex_or
 from napalm.base.netmiko_helpers import netmiko_args
 import napalm.base.constants as c
 
@@ -83,6 +85,7 @@ class NXOSDriverBase(NetworkDriver):
         self.candidate_cfg = "candidate_config.txt"
         self.rollback_cfg = "rollback_config.txt"
         self._dest_file_system = optional_args.pop("dest_file_system", "bootflash:")
+        self.force_no_enable = optional_args.get("force_no_enable", False)
         self.netmiko_optional_args = netmiko_args(optional_args)
         self.device = None
 
@@ -327,36 +330,20 @@ class NXOSDriverBase(NetworkDriver):
                     if "Unreachable" in line:
                         if "(" in fields[2]:
                             results_array.append(
-                                {
-                                    "ip_address": py23_compat.text_type(
-                                        fields[2][1:-1]
-                                    ),
-                                    "rtt": 0.0,
-                                }
+                                {"ip_address": str(fields[2][1:-1]), "rtt": 0.0}
                             )
                         else:
                             results_array.append(
-                                {
-                                    "ip_address": py23_compat.text_type(fields[1]),
-                                    "rtt": 0.0,
-                                }
+                                {"ip_address": str(fields[1]), "rtt": 0.0}
                             )
                     elif "truncated" in line:
                         if "(" in fields[4]:
                             results_array.append(
-                                {
-                                    "ip_address": py23_compat.text_type(
-                                        fields[4][1:-2]
-                                    ),
-                                    "rtt": 0.0,
-                                }
+                                {"ip_address": str(fields[4][1:-2]), "rtt": 0.0}
                             )
                         else:
                             results_array.append(
-                                {
-                                    "ip_address": py23_compat.text_type(fields[3][:-1]),
-                                    "rtt": 0.0,
-                                }
+                                {"ip_address": str(fields[3][:-1]), "rtt": 0.0}
                             )
                     elif fields[1] == "bytes":
                         if version == "6":
@@ -364,10 +351,7 @@ class NXOSDriverBase(NetworkDriver):
                         else:
                             m = fields[6][5:]
                         results_array.append(
-                            {
-                                "ip_address": py23_compat.text_type(fields[3][:-1]),
-                                "rtt": float(m),
-                            }
+                            {"ip_address": str(fields[3][:-1]), "rtt": float(m)}
                         )
                 elif "packets transmitted" in line:
                     ping_dict["success"]["probes_sent"] = int(fields[0])
@@ -478,8 +462,8 @@ class NXOSDriverBase(NetworkDriver):
                     traceroute_result["success"][hop_index]["probes"][
                         probe_index + 1
                     ] = {
-                        "host_name": py23_compat.text_type(host_name),
-                        "ip_address": py23_compat.text_type(ip_address),
+                        "host_name": str(host_name),
+                        "ip_address": str(ip_address),
                         "rtt": rtt,
                     }
                     previous_probe_host_name = host_name
@@ -522,7 +506,7 @@ class NXOSDriverBase(NetworkDriver):
     @staticmethod
     def _create_tmp_file(config):
         tmp_dir = tempfile.gettempdir()
-        rand_fname = py23_compat.text_type(uuid.uuid4())
+        rand_fname = str(uuid.uuid4())
         filename = os.path.join(tmp_dir, rand_fname)
         with open(filename, "wt") as fobj:
             fobj.write(config)
@@ -531,21 +515,36 @@ class NXOSDriverBase(NetworkDriver):
     def _disable_confirmation(self):
         self._send_command_list(["terminal dont-ask"])
 
-    def get_config(self, retrieve="all", full=False):
+    def get_config(self, retrieve="all", full=False, sanitized=False):
+
+        # NX-OS adds some extra, unneeded lines that should be filtered.
+        filter_strings = [
+            r"!Command: show .*$",
+            r"!Time:.*\d{4}\s*$",
+            r"Startup config saved at:.*$",
+        ]
+        filter_pattern = generate_regex_or(filter_strings)
+
         config = {"startup": "", "running": "", "candidate": ""}  # default values
         # NX-OS only supports "all" on "show run"
         run_full = " all" if full else ""
 
         if retrieve.lower() in ("running", "all"):
-            command = "show running-config{}".format(run_full)
-            config["running"] = py23_compat.text_type(
-                self._send_command(command, raw_text=True)
-            )
+            command = f"show running-config{run_full}"
+            output = self._send_command(command, raw_text=True)
+            output = re.sub(filter_pattern, "", output, flags=re.M)
+            config["running"] = output.strip()
         if retrieve.lower() in ("startup", "all"):
             command = "show startup-config"
-            config["startup"] = py23_compat.text_type(
-                self._send_command(command, raw_text=True)
+            output = self._send_command(command, raw_text=True)
+            output = re.sub(filter_pattern, "", output, flags=re.M)
+            config["startup"] = output.strip()
+
+        if sanitized:
+            return napalm.base.helpers.sanitize_configs(
+                config, c.CISCO_SANITIZE_FILTERS
             )
+
         return config
 
     def get_lldp_neighbors(self):
@@ -574,7 +573,7 @@ class NXOSDriverBase(NetworkDriver):
         else:
             command = "show lldp neighbors detail"
         lldp_entries = self._send_command(command, raw_text=True)
-        lldp_entries = py23_compat.text_type(lldp_entries)
+        lldp_entries = str(lldp_entries)
         lldp_entries = napalm.base.helpers.textfsm_extractor(
             self, "show_lldp_neighbors_detail", lldp_entries
         )
@@ -635,9 +634,32 @@ class NXOSDriverBase(NetworkDriver):
 
     def _get_command_table(self, command, table_name, row_name):
         json_output = self._send_command(command)
-        if type(json_output) is not dict:
+        if type(json_output) is not dict and json_output:
             json_output = json.loads(json_output)
         return self._get_reply_table(json_output, table_name, row_name)
+
+    def _parse_vlan_ports(self, vlan_s):
+        vlans = []
+        find_regexp = r"^([A-Za-z\/-]+|.*\/)(\d+)-(\d+)$"
+        vlan_str = ""
+
+        if isinstance(vlan_s, list):
+            vlan_str = ",".join(vlan_s)
+        else:
+            vlan_str = vlan_s
+
+        for vls in vlan_str.split(","):
+            find = re.findall(find_regexp, vls.strip())
+            if find:
+                for i in range(int(find[0][1]), int(find[0][2]) + 1):
+                    vlans.append(
+                        napalm.base.helpers.canonical_interface_name(
+                            find[0][0] + str(i)
+                        )
+                    )
+            else:
+                vlans.append(napalm.base.helpers.canonical_interface_name(vls.strip()))
+        return vlans
 
 
 class NXOSDriver(NXOSDriverBase):
@@ -692,7 +714,7 @@ class NXOSDriver(NXOSDriverBase):
         return self.device.config_list(commands)
 
     def _send_config(self, commands):
-        if isinstance(commands, py23_compat.string_types):
+        if isinstance(commands, str):
             # Has to be a list generator and not generator expression (not JSON serializable)
             commands = [command for command in commands.splitlines() if command]
         return self.device.config_list(commands)
@@ -807,7 +829,7 @@ class NXOSDriver(NXOSDriverBase):
         facts["model"] = show_version.get("chassis_id", "")
         facts["hostname"] = show_version.get("host_name", "")
         facts["os_version"] = show_version.get(
-            "sys_ver_str", show_version.get("rr_sys_ver", "")
+            "sys_ver_str", show_version.get("kickstart_ver_str", "")
         )
 
         uptime_days = show_version.get("kern_uptm_days", 0)
@@ -844,30 +866,51 @@ class NXOSDriver(NXOSDriverBase):
 
         for interface_details in interfaces_body:
             interface_name = interface_details.get("interface")
-            interface_mtu = interface_details.get("eth_mtu", 0)
-            interface_mtu = int(interface_mtu)
+
+            if interface_details.get("eth_mtu"):
+                interface_mtu = int(interface_details["eth_mtu"])
+            elif interface_details.get("svi_mtu"):
+                interface_mtu = int(interface_details["svi_mtu"])
+            else:
+                interface_mtu = 0
+
             # Earlier version of Nexus returned a list for 'eth_bw' (observed on 7.1(0)N1(1a))
-            interface_speed = interface_details.get("eth_bw", 0)
+            if interface_details.get("eth_bw"):
+                interface_speed = interface_details["eth_bw"]
+            elif interface_details.get("svi_bw"):
+                interface_speed = interface_details["svi_bw"]
+            else:
+                interface_speed = 0
             if isinstance(interface_speed, list):
                 interface_speed = interface_speed[0]
-            interface_speed = int(interface_speed / 1000)
+            interface_speed = int(int(interface_speed) / 1000)
+
             if "admin_state" in interface_details:
                 is_up = interface_details.get("admin_state", "") == "up"
+            elif "svi_admin_state" in interface_details:
+                is_up = interface_details.get("svi_admin_state", "") == "up"
             else:
                 is_up = interface_details.get("state", "") == "up"
+            if interface_details.get("eth_hw_addr"):
+                mac_address = interface_details["eth_hw_addr"]
+            elif interface_details.get("svi_mac"):
+                mac_address = interface_details["svi_mac"].strip()
+            else:
+                mac_address = None
             interfaces[interface_name] = {
                 "is_up": is_up,
-                "is_enabled": (interface_details.get("state") == "up"),
-                "description": py23_compat.text_type(
-                    interface_details.get("desc", "").strip('"')
+                "is_enabled": (
+                    interface_details.get("state") == "up"
+                    or interface_details.get("svi_admin_state") == "up"
                 ),
+                "description": str(interface_details.get("desc", "").strip('"')),
                 "last_flapped": self._compute_timestamp(
                     interface_details.get("eth_link_flapped", "")
                 ),
                 "speed": interface_speed,
                 "mtu": interface_mtu,
                 "mac_address": napalm.base.helpers.convert(
-                    napalm.base.helpers.mac, interface_details.get("eth_hw_addr")
+                    napalm.base.helpers.mac, mac_address
                 ),
             }
         return interfaces
@@ -902,10 +945,7 @@ class NXOSDriver(NXOSDriverBase):
             vrf_list = []
 
         for vrf_dict in vrf_list:
-            result_vrf_dict = {
-                "router_id": py23_compat.text_type(vrf_dict["vrf-router-id"]),
-                "peers": {},
-            }
+            result_vrf_dict = {"router_id": str(vrf_dict["vrf-router-id"]), "peers": {}}
 
             af_list = vrf_dict.get("TABLE_af", {}).get("ROW_af", [])
             if isinstance(af_list, dict):
@@ -925,7 +965,7 @@ class NXOSDriver(NXOSDriverBase):
                     remoteas = napalm.base.helpers.as_number(
                         neighbor_dict["neighboras"]
                     )
-                    state = py23_compat.text_type(neighbor_dict["state"])
+                    state = str(neighbor_dict["state"])
 
                     bgp_state = bgp_state_dict[state]
                     afid_dict = af_name_dict[int(af_dict["af-id"])]
@@ -964,7 +1004,7 @@ class NXOSDriver(NXOSDriverBase):
 
         for command in commands:
             command_output = self._send_command(command, raw_text=True)
-            cli_output[py23_compat.text_type(command)] = command_output
+            cli_output[str(command)] = command_output
         return cli_output
 
     def get_arp_table(self, vrf=""):
@@ -1000,7 +1040,7 @@ class NXOSDriver(NXOSDriverBase):
                         age_sec = -1.0
             age_sec = round(age_sec, 1)
 
-            interface = py23_compat.text_type(arp_table_entry.get("intf-out"))
+            interface = str(arp_table_entry.get("intf-out"))
             arp_table.append(
                 {
                     "interface": interface,
@@ -1071,9 +1111,9 @@ class NXOSDriver(NXOSDriverBase):
         )
 
         for interface in ipv4_interf_table_vrf:
-            interface_name = py23_compat.text_type(interface.get("intf-name", ""))
+            interface_name = str(interface.get("intf-name", ""))
             addr_str = interface.get("prefix")
-            unnumbered = py23_compat.text_type(interface.get("unnum-intf", ""))
+            unnumbered = str(interface.get("unnum-intf", ""))
             if addr_str:
                 address = napalm.base.helpers.ip(addr_str)
                 prefix = int(interface.get("masklen", ""))
@@ -1088,7 +1128,7 @@ class NXOSDriver(NXOSDriverBase):
                 )
             elif unnumbered:
                 for interf in ipv4_interf_table_vrf:
-                    interf_name = py23_compat.text_type(interf.get("intf-name", ""))
+                    interf_name = str(interf.get("intf-name", ""))
                     if interf_name == unnumbered:
                         address = napalm.base.helpers.ip(interf.get("prefix"))
                         prefix = int(interf.get("masklen", ""))
@@ -1123,12 +1163,17 @@ class NXOSDriver(NXOSDriverBase):
                 )
 
         ipv6_command = "show ipv6 interface"
-        ipv6_interf_table_vrf = self._get_command_table(
-            ipv6_command, "TABLE_intf", "ROW_intf"
-        )
+        # If the switch doesn't run IPv6 or support it the show ipv6 interface
+        # command will throw an error so catch it and return the ipv4 addresses
+        try:
+            ipv6_interf_table_vrf = self._get_command_table(
+                ipv6_command, "TABLE_intf", "ROW_intf"
+            )
+        except napalm.nxapi_plumbing.errors.NXAPIPostError:
+            return interfaces_ip
 
         for interface in ipv6_interf_table_vrf:
-            interface_name = py23_compat.text_type(interface.get("intf-name", ""))
+            interface_name = str(interface.get("intf-name", ""))
 
             if interface_name not in interfaces_ip.keys():
                 interfaces_ip[interface_name] = {}
@@ -1179,7 +1224,7 @@ class NXOSDriver(NXOSDriverBase):
 
         for mac_entry in mac_table_raw:
             raw_mac = mac_entry.get("disp_mac_addr")
-            interface = py23_compat.text_type(mac_entry.get("disp_port"))
+            interface = str(mac_entry.get("disp_port"))
             try:
                 vlan = int(mac_entry.get("disp_vlan"))
             except ValueError:
@@ -1213,34 +1258,34 @@ class NXOSDriver(NXOSDriverBase):
             return snmp_information
 
         snmp_information = {
-            "contact": py23_compat.text_type(""),
-            "location": py23_compat.text_type(""),
+            "contact": str(""),
+            "location": str(""),
             "community": {},
-            "chassis_id": py23_compat.text_type(""),
+            "chassis_id": str(""),
         }
 
         for snmp_entry in snmp_config:
-            contact = py23_compat.text_type(snmp_entry.get("contact", ""))
+            contact = str(snmp_entry.get("contact", ""))
             if contact:
                 snmp_information["contact"] = contact
-            location = py23_compat.text_type(snmp_entry.get("location", ""))
+            location = str(snmp_entry.get("location", ""))
             if location:
                 snmp_information["location"] = location
 
-            community_name = py23_compat.text_type(snmp_entry.get("community", ""))
+            community_name = str(snmp_entry.get("community", ""))
             if not community_name:
                 continue
 
             if community_name not in snmp_information["community"].keys():
                 snmp_information["community"][community_name] = {
-                    "acl": py23_compat.text_type(snmp_entry.get("acl", "")),
-                    "mode": py23_compat.text_type(snmp_entry.get("mode", "").lower()),
+                    "acl": str(snmp_entry.get("acl", "")),
+                    "mode": str(snmp_entry.get("mode", "").lower()),
                 }
             else:
-                acl = py23_compat.text_type(snmp_entry.get("acl", ""))
+                acl = str(snmp_entry.get("acl", ""))
                 if acl:
                     snmp_information["community"][community_name]["acl"] = acl
-                mode = py23_compat.text_type(snmp_entry.get("mode", "").lower())
+                mode = str(snmp_entry.get("mode", "").lower())
                 if mode:
                     snmp_information["community"][community_name]["mode"] = mode
         return snmp_information
@@ -1266,7 +1311,7 @@ class NXOSDriver(NXOSDriverBase):
 
             password = user.get("password", "")
             if password:
-                users[username]["password"] = py23_compat.text_type(password.strip())
+                users[username]["password"] = str(password.strip())
 
             level = 0
             role = user.get("role", "")
@@ -1284,7 +1329,7 @@ class NXOSDriver(NXOSDriverBase):
             if sshkeytype and sshkeyvalue:
                 if sshkeytype not in ["ssh-rsa", "ssh-dsa"]:
                     continue
-                users[username]["sshkeys"].append(py23_compat.text_type(sshkeyvalue))
+                users[username]["sshkeys"].append(str(sshkeyvalue))
         return users
 
     def get_network_instances(self, name=""):
@@ -1303,11 +1348,11 @@ class NXOSDriver(NXOSDriverBase):
         # create a dictionary with key = 'vrf_name' and value = list of interfaces
         vrf_intfs = defaultdict(list)
         for intf in intf_table_raw:
-            vrf_intfs[intf["vrf_name"]].append(py23_compat.text_type(intf["if_name"]))
+            vrf_intfs[intf["vrf_name"]].append(str(intf["if_name"]))
 
         vrfs = {}
         for vrf in vrf_table_raw:
-            vrf_name = py23_compat.text_type(vrf.get("vrf_name"))
+            vrf_name = str(vrf.get("vrf_name"))
             vrfs[vrf_name] = {}
             vrfs[vrf_name]["name"] = vrf_name
 
@@ -1317,9 +1362,7 @@ class NXOSDriver(NXOSDriverBase):
             else:
                 vrfs[vrf_name]["type"] = "L3VRF"
 
-            vrfs[vrf_name]["state"] = {
-                "route_distinguisher": py23_compat.text_type(vrf.get("rd"))
-            }
+            vrfs[vrf_name]["state"] = {"route_distinguisher": str(vrf.get("rd"))}
 
             # convert list of interfaces (vrf_intfs[vrf_name]) to expected format
             # format = dict with key = interface name and empty values
@@ -1332,7 +1375,7 @@ class NXOSDriver(NXOSDriverBase):
         # only return results for this particular VRF
         if name:
             if name in vrfs.keys():
-                return {py23_compat.text_type(name): vrfs[name]}
+                return {str(name): vrfs[name]}
             else:
                 return {}
         # else return results for all VRFs
@@ -1342,7 +1385,12 @@ class NXOSDriver(NXOSDriverBase):
     def get_environment(self):
         def _process_pdus(power_data):
             normalized = defaultdict(dict)
-            ps_info_table = power_data["TABLE_psinfo"]
+            # some nexus devices have keys postfixed with the shorthand device series name (ie n3k)
+            # ex. on a 9k, the key is TABLE_psinfo, but on a 3k it is TABLE_psinfo_n3k
+            ps_info_key = [
+                i for i in power_data.keys() if i.startswith("TABLE_psinfo")
+            ][0]
+            ps_info_table = power_data[ps_info_key]
             # Later version of nxos will have a list under TABLE_psinfo like
             # TABLE_psinfo : [{'ROW_psinfo': {...
             # and not have the psnum under the row
@@ -1365,17 +1413,28 @@ class NXOSDriver(NXOSDriverBase):
                     count += 1
                     tmp_table.append(tmp)
                 ps_info_table = {"ROW_psinfo": tmp_table}
-            for psinfo in ps_info_table["ROW_psinfo"]:
+            # some nexus devices have keys postfixed with the shorthand device series name (ie n3k)
+            # ex. on a 9k the key is ROW_psinfo, but on a 3k it is ROW_psinfo_n3k
+            ps_info_row_key = [
+                i for i in ps_info_table.keys() if i.startswith("ROW_psinfo")
+            ][0]
+            for psinfo in ps_info_table[ps_info_row_key]:
                 normalized[psinfo["psnum"]]["status"] = (
                     psinfo.get("ps_status", "ok") == "ok"
                 )
                 normalized[psinfo["psnum"]]["output"] = float(psinfo.get("watts", -1.0))
+                # Newer nxos versions provide the total capacity in the `tot_capa` key
+                if "tot_capa" in psinfo:
+                    normalized[psinfo["psnum"]]["capacity"] = float(
+                        psinfo["tot_capa"].split()[0]
+                    )
                 # The capacity of the power supply can be determined by the model
                 # ie N2200-PAC-400W = 400 watts
-                ps_model = psinfo.get("psmodel", "-1")
-                normalized[psinfo["psnum"]]["capacity"] = float(
-                    ps_model.split("-")[-1][:-1]
-                )
+                else:
+                    ps_model = psinfo.get("psmodel", "-1")
+                    normalized[psinfo["psnum"]]["capacity"] = float(
+                        ps_model.split("-")[-1][:-1]
+                    )
             return json.loads(json.dumps(normalized))
 
         def _process_fans(fan_data):
@@ -1440,3 +1499,21 @@ class NXOSDriver(NXOSDriverBase):
             "cpu": _process_cpu(cpu_raw),
             "memory": _process_memory(memory_raw),
         }
+
+    def get_vlans(self):
+        vlans = {}
+        command = "show vlan brief"
+        vlan_table_raw = self._get_command_table(
+            command, "TABLE_vlanbriefxbrief", "ROW_vlanbriefxbrief"
+        )
+        if isinstance(vlan_table_raw, dict):
+            vlan_table_raw = [vlan_table_raw]
+
+        for vlan in vlan_table_raw:
+            if "vlanshowplist-ifidx" not in vlan.keys():
+                vlan["vlanshowplist-ifidx"] = []
+            vlans[vlan["vlanshowbr-vlanid"]] = {
+                "name": vlan["vlanshowbr-vlanname"],
+                "interfaces": self._parse_vlan_ports(vlan["vlanshowplist-ifidx"]),
+            }
+        return vlans
